@@ -77,6 +77,12 @@ echo "== clear"
 run clear; check "clear succeeds" "$?" 0
 check "nothing of ours is left" "$(n186)" 0
 
+echo "== why the server route is needed (Amnezia reads routes into 8 KiB)"
+python3 "$SCRIPT" sync --routes "$HERE/../examples/routes.ru-sites.json" --state "$STATE" >/dev/null 2>&1
+python3 "$HERE/../tools/netlink-check.py" >/dev/null; check "full example list overflows the 8 KiB reader" "$?" 1
+python3 "$SCRIPT" clear --routes "$HERE/../examples/routes.ru-sites.json" --state "$STATE" >/dev/null 2>&1
+python3 "$HERE/../tools/netlink-check.py" >/dev/null; check "small table fits again after clear" "$?" 0
+
 rm -rf "$WORK"
 [ "$FAILS" = 0 ] && { echo "ALL PASSED"; exit 0; }
 echo "$FAILS FAILED"; exit 1
