@@ -1,0 +1,7 @@
+# Copy to /etc/amnezia-ru-split/vpn-endpoints
+# Public IPv4 addresses of the VPN servers Amnezia connects to, one per line.
+# amnezia-ru-split keeps a direct host route to each of them, because the Amnezia
+# daemon cannot find the default gateway by itself on a big routing table.
+# Add the new address when you switch to another server.
+#
+# 198.51.100.7   <- replace with your server (this is a documentation address)

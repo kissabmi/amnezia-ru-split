@@ -1,0 +1,4 @@
+# Optional. Copy to /etc/amnezia-ru-split/health-hosts
+# Hosts that must answer HTTP 200 over HTTPS while the VPN is on.
+# `install` and `health` check them; leave the file out to skip the check.
+# ya.ru

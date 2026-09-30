@@ -1,0 +1,505 @@
+#!/usr/bin/python3
+"""Keep Russian sites direct while AmneziaVPN is on (Linux), and keep the VPN server reachable.
+
+Adds narrow IPv4 routes through the physical gateway; never stops the VPN, changes
+default routes or flushes routing tables. See README.md."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import ipaddress
+import json
+import os
+import shlex
+import shutil
+import signal
+
+FIREWALL_CHAIN = "amnvpn.110.allowNets"
+FIREWALL_TAG = "ryoku-ru-split-web-v1"
+SERVICE = "/etc/systemd/system/amnezia-ru-split-direct.service"
+TIMER = "/etc/systemd/system/amnezia-ru-split-direct.timer"
+import subprocess
+import tempfile
+from pathlib import Path
+
+IP = "/usr/bin/ip"
+PROTOCOL = 186
+METRIC = 42760
+OWNER = "/usr/local/libexec/amnezia-ru-split"
+ROUTES = "/etc/amnezia-ru-split/routes.json"
+STATE = "/run/amnezia-ru-split-direct"
+DISPATCHER = "/etc/NetworkManager/dispatcher.d/90-amnezia-ru-split"
+ENDPOINTS = "/etc/amnezia-ru-split/vpn-endpoints"
+HEALTH_HOSTS = "/etc/amnezia-ru-split/health-hosts"
+PROTECTED = ["1.1.1.1", "8.8.8.8"]
+
+
+def command(args: list[str], timeout: int = 20) -> str:
+    result = subprocess.run(
+        args, capture_output=True, text=True, timeout=timeout, check=False
+    )
+    if result.returncode:
+        raise RuntimeError(
+            f"{Path(args[0]).name} exit={result.returncode}: {result.stderr.strip()[:300]}"
+        )
+    return result.stdout.strip()
+
+
+def config_lines(path: str) -> list[str]:
+    """Non-empty lines of an optional config file, '#' starts a comment."""
+    file = Path(path)
+    if not file.exists():
+        return []
+    lines = (line.split("#", 1)[0].strip() for line in file.read_text().splitlines())
+    return [line for line in lines if line]
+
+
+def vpn_endpoints() -> list[str]:
+    """Public IPv4 addresses of the VPN servers (see ENDPOINTS)."""
+    result = []
+    for line in config_lines(ENDPOINTS):
+        address = ipaddress.ip_address(line)
+        if address.version != 4 or not address.is_global:
+            raise ValueError(f"VPN endpoint must be a public IPv4 address: {line}")
+        result.append(str(address))
+    return result
+
+
+def networks(path: Path) -> list[str]:
+    data = json.loads(path.read_text())
+    if not isinstance(data, list) or not 1 <= len(data) <= 2048:
+        raise ValueError("Expected a bounded list of IPv4 exclusions")
+    endpoints = vpn_endpoints()
+    result = set()
+    for item in data:
+        net = ipaddress.ip_network(item["hostname"], strict=True)
+        if net.version != 4 or not net.is_global or net.prefixlen < 12:
+            raise ValueError("Non-public or overly broad exclusion")
+        if any(ipaddress.ip_address(ip) in net for ip in PROTECTED + endpoints):
+            raise ValueError("Exclusion overlaps a protected VPN/DNS endpoint")
+        result.add(str(net))
+    return sorted(
+        result,
+        key=lambda n: (
+            int(ipaddress.ip_network(n).network_address),
+            ipaddress.ip_network(n).prefixlen,
+        ),
+    )
+
+
+def prefix_of(dst: str) -> str:
+    """ip prints host routes without /32; routes.json and desired() use /32."""
+    try:
+        return str(ipaddress.ip_network(dst, strict=False))
+    except ValueError:
+        return dst
+
+
+def observed() -> list[dict]:
+    routes = json.loads(
+        command(
+            [IP, "-j", "-4", "route", "show", "table", "main", "proto", str(PROTOCOL)]
+        )
+    )
+    return sorted(
+        [
+            {"dst": prefix_of(r["dst"]), "gateway": r["gateway"], "dev": r["dev"]}
+            for r in routes
+            if r.get("metric") == METRIC
+        ],
+        key=lambda r: (r["dst"], r["gateway"], r["dev"]),
+    )
+
+
+def physical_default() -> dict | None:
+    defaults = json.loads(command([IP, "-j", "-4", "route", "show", "default"]))
+    physical = [
+        r
+        for r in defaults
+        if r.get("gateway")
+        and not r.get("dev", "").startswith(("amn", "wg", "tun", "tap"))
+    ]
+    if not physical:
+        return None
+    best = min(r.get("metric", 0) for r in physical)
+    candidates = [r for r in physical if r.get("metric", 0) == best]
+    if len(candidates) != 1:
+        raise RuntimeError("Ambiguous physical gateway; refusing to guess")
+    return candidates[0]
+
+
+def desired(prefixes: list[str]) -> list[dict]:
+    default = physical_default()
+    if default is None:
+        return []
+    return [
+        {"dst": p, "gateway": default["gateway"], "dev": default["dev"]}
+        for p in prefixes
+    ]
+
+
+def endpoint_routes(action: str) -> None:
+    """Keep host routes to the VPN servers on the physical link.
+
+    The Amnezia daemon reads the default gateway with an 8 KiB netlink buffer.
+    Once the routing table dump outgrows it, the daemon logs "No default gateway
+    available, skipping exclusion route", never excludes the server, and the
+    tunnel's own UDP loops into amn0: no handshake, kill switch blocks the rest.
+    Idempotent; only touches /32 routes tagged with our protocol and metric 0."""
+    clearing = action in ("clear", "uninstall")
+    default = None if clearing else physical_default()
+    if default is None and not clearing:
+        return
+    for address in vpn_endpoints():
+        dst = f"{address}/32"
+        ours = json.loads(
+            command(
+                [IP, "-j", "-4", "route", "show", "to", "exact", dst]
+                + ["proto", str(PROTOCOL)]
+            )
+        )
+        if clearing:
+            if ours:
+                command([IP, "-4", "route", "del", dst, "proto", str(PROTOCOL)])
+            continue
+        if any(
+            r.get("gateway") == default["gateway"] and r.get("dev") == default["dev"]
+            for r in ours
+        ):
+            continue
+        command(
+            [IP, "-4", "route", "replace", dst, "via", default["gateway"]]
+            + ["dev", default["dev"], "proto", str(PROTOCOL)]
+        )
+
+
+def change(action: str, route: dict) -> None:
+    command(
+        [
+            IP,
+            "-4",
+            "route",
+            action,
+            route["dst"],
+            "via",
+            route["gateway"],
+            "dev",
+            route["dev"],
+            "proto",
+            str(PROTOCOL),
+            "metric",
+            str(METRIC),
+        ]
+    )
+
+
+def atomic_json(path: Path, value: object) -> None:
+    fd, name = tempfile.mkstemp(prefix=".new-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            json.dump(value, stream, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(name, path)
+    finally:
+        Path(name).unlink(missing_ok=True)
+
+
+def firewall_rules() -> list[list[str]]:
+    text = command(["/usr/bin/iptables", "-w", "3", "-t", "filter", "-S"])
+    return [
+        parts[2:]
+        for line in text.splitlines()
+        if (parts := shlex.split(line))[:2] == ["-A", FIREWALL_CHAIN]
+        and FIREWALL_TAG in parts
+    ]
+
+
+def firewall_chain_exists() -> bool:
+    return (
+        subprocess.run(
+            ["/usr/bin/iptables", "-w", "3", "-t", "filter", "-S", FIREWALL_CHAIN],
+            capture_output=True,
+            timeout=20,
+            check=False,
+        ).returncode
+        == 0
+    )
+
+
+def firewall_sync(rules: list[list[str]]) -> None:
+    if not firewall_chain_exists():
+        return  # Amnezia firewall is down (VPN off); rules return on the next sync
+    current = firewall_rules()
+    for rule in current:
+        if rule not in rules:
+            command(["/usr/bin/iptables", "-w", "3", "-D", FIREWALL_CHAIN, *rule])
+    for rule in rules:
+        if rule not in current:
+            command(["/usr/bin/iptables", "-w", "3", "-A", FIREWALL_CHAIN, *rule])
+
+
+def web_rules(target: list[dict]) -> list[list[str]]:
+    return [
+        [
+            "-d",
+            str(ipaddress.ip_network(r["dst"])),
+            "-o",
+            r["dev"],
+            "-p",
+            proto,
+            "-m",
+            "multiport",
+            "--dports",
+            "80,443",
+            "-m",
+            "comment",
+            "--comment",
+            FIREWALL_TAG,
+            "-j",
+            "ACCEPT",
+        ]
+        for r in target
+        for proto in ["tcp", "udp"]
+    ]
+
+
+def transition(target: list[dict]) -> None:
+    before_routes = observed()
+    before_firewall = firewall_rules()
+    mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM})
+    try:
+        try:
+            routes_transition(target)
+            firewall_sync(web_rules(target))
+        except BaseException:
+            firewall_sync(before_firewall)
+            routes_transition(before_routes)
+            raise
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+
+
+def routes_transition(target: list[dict]) -> None:
+    before = observed()
+    removed: list[dict] = []
+    added: list[dict] = []
+    try:
+        for route in before:
+            if route not in target:
+                change("del", route)
+                removed.append(route)
+        for route in target:
+            if route not in before:
+                change("add", route)
+                added.append(route)
+    except BaseException:
+        errors = []
+        for route in reversed(added):
+            try:
+                change("del", route)
+            except RuntimeError as error:
+                errors.append(str(error))
+        for route in removed:
+            try:
+                change("add", route)
+            except RuntimeError as error:
+                errors.append(str(error))
+        if errors:
+            raise RuntimeError(
+                "Route rollback needs attention: " + "; ".join(errors)
+            ) from None
+        raise
+
+
+def health() -> dict:
+    route = json.loads(command([IP, "-j", "-4", "route", "get", "1.1.1.1"]))[0]
+    if route.get("dev") != "amn0":
+        raise RuntimeError("Default traffic is not on the existing VPN")
+    egress = command(
+        [
+            "/usr/bin/curl",
+            "-4",
+            "--noproxy",
+            "*",
+            "-fsS",
+            "--max-time",
+            "12",
+            "https://api.ipify.org",
+        ]
+    )
+    if egress not in vpn_endpoints():
+        raise RuntimeError(
+            f"VPN egress {egress[:80]} is not listed in {ENDPOINTS}; "
+            "add the server address there"
+        )
+    result: dict = {"vpn_egress": egress, "direct_hosts": {}}
+    for host in config_lines(HEALTH_HOSTS):
+        code = command(
+            [
+                "/usr/bin/curl",
+                "-4",
+                "--noproxy",
+                "*",
+                "-sS",
+                "-L",
+                "--max-time",
+                "15",
+                "-o",
+                "/dev/null",
+                "-w",
+                "%{http_code}",
+                "https://" + host,
+            ]
+        )
+        result["direct_hosts"][host] = code
+        if code != "200":
+            raise RuntimeError(f"Direct HTTPS check failed: {host} status={code}")
+    return result
+
+
+def persistence(routes_path: Path) -> None:
+    paths = [Path(OWNER), Path(ROUTES), Path(DISPATCHER), Path(SERVICE), Path(TIMER)]
+    if any(p.exists() or p.is_symlink() for p in paths):
+        raise RuntimeError("Existing installation; refusing to overwrite")
+    created = []
+    try:
+        for p in paths:
+            p.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(Path(__file__).resolve(), paths[0])
+        created.append(paths[0])
+        paths[0].chmod(0o755)
+        shutil.copyfile(routes_path, paths[1])
+        created.append(paths[1])
+        paths[1].chmod(0o644)
+        paths[2].write_text(
+            '#!/usr/bin/python3\nimport os, sys\nif len(sys.argv)>2 and sys.argv[2] in {"up", "down", "dhcp4-change", "connectivity-change", "vpn-up", "vpn-down"}:\n    os.execv("'
+            + OWNER
+            + '", ["'
+            + OWNER
+            + '", "sync"])\n'
+        )
+        created.append(paths[2])
+        paths[2].chmod(0o755)
+        paths[3].write_text(
+            "[Unit]\nDescription=Reconcile selected direct web routes without restarting VPN\nAfter=NetworkManager.service\n[Service]\nType=oneshot\nExecStart="
+            + OWNER
+            + " sync\nTimeoutStartSec=120\nUMask=0077\n"
+        )
+        created.append(paths[3])
+        paths[4].write_text(
+            "[Unit]\nDescription=Restore selected web exceptions after Amnezia firewall refresh\n[Timer]\nOnBootSec=30s\nOnUnitInactiveSec=30s\nAccuracySec=3s\n[Install]\nWantedBy=timers.target\n"
+        )
+        created.append(paths[4])
+        for p in paths[3:]:
+            p.chmod(0o644)
+        command(["/usr/bin/systemctl", "daemon-reload"])
+        command(["/usr/bin/systemctl", "enable", "--now", Path(TIMER).name])
+    except BaseException:
+        subprocess.run(
+            ["/usr/bin/systemctl", "disable", "--now", Path(TIMER).name],
+            capture_output=True,
+            timeout=15,
+            check=False,
+        )
+        for p in reversed(created):
+            p.unlink(missing_ok=True)
+        subprocess.run(
+            ["/usr/bin/systemctl", "daemon-reload"],
+            capture_output=True,
+            timeout=15,
+            check=False,
+        )
+        raise
+
+
+def terminate(_signum: int, _frame: object) -> None:
+    raise KeyboardInterrupt("Interrupted; rolling back the current operation")
+
+
+def main() -> None:
+    signal.signal(signal.SIGTERM, terminate)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "action", choices=["plan", "sync", "clear", "install", "uninstall", "health"]
+    )
+    parser.add_argument("--routes", type=Path, default=Path(ROUTES))
+    parser.add_argument("--state", type=Path, default=Path(STATE))
+    args = parser.parse_args()
+    if args.action == "health":
+        print(json.dumps(health(), indent=2))
+        return
+    prefixes = [] if args.action in ["clear", "uninstall"] else networks(args.routes)
+    target = [] if args.action in ["clear", "uninstall"] else desired(prefixes)
+    if args.action == "plan":
+        print(
+            json.dumps(
+                {
+                    "routes": len(target),
+                    "gateway": target[0]["gateway"] if target else None,
+                    "device": target[0]["dev"] if target else None,
+                    "vpn_and_default_routes": "untouched",
+                },
+                indent=2,
+            )
+        )
+        return
+    if os.geteuid() != 0:
+        raise SystemExit("Administrator confirmation required; plan is read-only")
+    if args.action == "uninstall":
+        command(["/usr/bin/systemctl", "disable", "--now", Path(TIMER).name])
+        command(["/usr/bin/systemctl", "stop", Path(SERVICE).name])
+    if args.state.is_symlink():
+        raise RuntimeError("Unsafe state directory")
+    args.state.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if args.state.stat().st_uid != 0:
+        raise RuntimeError("State directory must be root-owned")
+    args.state.chmod(0o700)
+    with (args.state / "lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if args.action == "sync" and not args.routes.exists():
+            return  # A queued dispatcher run must not resurrect an uninstalled setup.
+        endpoint_routes(args.action)
+        marker = args.state / "owned.json"
+        pending = args.state / "pending.json"
+        if pending.exists():
+            interrupted_before = json.loads(pending.read_text())
+            transition(interrupted_before)
+            atomic_json(marker, interrupted_before)
+            pending.unlink()
+        target = [] if args.action in ["clear", "uninstall"] else desired(prefixes)
+        before = observed()
+        if before and not marker.exists():
+            raise RuntimeError("Unclaimed tagged routes exist; refusing to adopt them")
+        atomic_json(args.state / "pending.json", before)
+        try:
+            transition(target)
+            if args.action == "install":
+                if not target:
+                    raise RuntimeError("No physical gateway")
+                print(json.dumps(health()), flush=True)
+                persistence(args.routes)
+            elif args.action == "uninstall":
+                for name in [DISPATCHER, OWNER, ROUTES, ENDPOINTS, SERVICE, TIMER]:
+                    Path(name).unlink(missing_ok=True)
+                command(["/usr/bin/systemctl", "daemon-reload"])
+            atomic_json(marker, target)
+        except BaseException:
+            transition(before)
+            atomic_json(marker, before)
+            pending.unlink(missing_ok=True)
+            print(
+                "Failed operation rolled back; default/VPN routes untouched", flush=True
+            )
+            raise
+        pending.unlink(missing_ok=True)
+        print(
+            json.dumps(
+                {"status": "PASS", "action": args.action, "owned_routes": len(target)}
+            )
+        )
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,5 @@
+# Personal data: your own prefix list and server addresses never go into the repo.
+/routes.json
+/vpn-endpoints
+/health-hosts
+__pycache__/
